@@ -330,6 +330,15 @@ public:
 
 
     /**
+     * Block all ranks in the communicator at this points.
+     */
+    void barrier() const
+    {
+        MPI_Barrier(comm);
+    }
+
+
+    /**
      * Probe for an incoming message and return its status. This method blocks
      * until there is an incoming message to probe.
      */
