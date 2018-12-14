@@ -11,22 +11,51 @@ namespace mpi {
     class Request;
     class Status;
 
-    static inline Communicator comm_world();
+    inline Communicator comm_world();
     constexpr int any_tag = MPI_ANY_TAG;
     constexpr int any_source = MPI_ANY_SOURCE;
+
+    namespace detail {
+        template <typename T> inline int make_datatype();
+    }
 }
+
+template <> int mpi::detail::make_datatype<char>  () { return MPI_CHAR; }
+template <> int mpi::detail::make_datatype<int>   () { return MPI_INTEGER; }
+template <> int mpi::detail::make_datatype<float> () { return MPI_FLOAT; }
+template <> int mpi::detail::make_datatype<double>() { return MPI_DOUBLE; }
 
 
 
 
 // ============================================================================
+/**
+ * A thin RAII wrapper around the MPI_Request struct. This is a movable, but
+ * non-copyable object. Keep it around on the stack in order to check on the
+ * status of a non-blocking communication and retrieve the message content.
+ * Requests are cancelled and deallocated (if necessary) when they go out of
+ * scope.
+ */
 class mpi::Request
 {
 public:
+
+
+    /**
+     * Default constructor, creates a null request.
+     */
     Request() {}
 
+
+    /**
+     * Request is a unique object, no copy's are permitted.
+     */
     Request(const Request& other) = delete;
 
+
+    /**
+     * Move constructor. Steals ownership of the other.
+     */
     Request(Request&& other)
     {
         buffer = std::move(other.buffer);
@@ -34,7 +63,42 @@ public:
         other.request = MPI_REQUEST_NULL;
     }
 
+
+    /**
+     * Destructor. Cancels the request if one is pending. For this reason, the
+     * request returned by non-blocking communications must be retained on the
+     * stack somewhere in order for the operation not to be cancelled.
+     */
     ~Request()
+    {
+        cancel();
+    }
+
+
+    /**
+     * Copy assignment is not permitted.
+     */
+    Request& operator=(const Request& other) = delete;
+
+
+    /**
+     * Move assignment. Cancels the current request (if one is pending) and
+     * steals ownership of the other.
+     */
+    Request& operator=(Request&& other)
+    {
+        cancel();
+        buffer = std::move(other.buffer);
+        request = other.request;
+        other.request = MPI_REQUEST_NULL;
+        return *this;        
+    }
+
+
+    /**
+     * Cancel this request and reset its state to null.
+     */
+    void cancel()
     {
         if (! is_null())
         {
@@ -43,41 +107,67 @@ public:
         }
     }
 
-    Request& operator=(const Request& other) = delete;
 
-    Request& operator=(Request&& other)
-    {
-        buffer = std::move(other.buffer);
-        request = other.request;
-        other.request = MPI_REQUEST_NULL;
-        return *this;        
-    }
-
+    /**
+     * Return true if this request is null.
+     */
     bool is_null() const
     {
         return request == MPI_REQUEST_NULL;
     }
 
-    bool test()
+
+    /**
+     * Check to see whether the request has completed. If it has, this method
+     * returns true and resets the request to a null state. If this method
+     * returns true and the request was for a non-blocking receive operation,
+     * the get() method can be called to retrieve the message content.
+     */
+    // bool test()
+    // {
+    //     int flag;
+    //     MPI_Test(&request, &flag, MPI_STATUS_IGNORE);
+    //     return flag;
+    // }
+
+
+    /**
+     * Check to see whether the request has completed. Like above, except
+     * this const method will not free the request if it has completed.
+     */
+    bool is_ready() const
     {
-        throw_if_null();
         int flag;
-        MPI_Test(&request, &flag, MPI_STATUS_IGNORE);
+        MPI_Request_get_status(request, &flag, MPI_STATUS_IGNORE);
         return flag;
     }
 
-    void wait()
-    {
-        throw_if_null();
-        MPI_Wait(&request, MPI_STATUS_IGNORE);
-    }
 
+    /**
+     * Block until the request is fulfilled. After this method returns, the
+     * get() method can be called to retrieve the message content.
+     */
+    // void wait()
+    // {
+    //     MPI_Wait(&request, MPI_STATUS_IGNORE);
+    // }
+
+
+    /**
+     * Block until the message is completed. Then deallocate the request, and
+     * return the message content.
+     */
     const std::string& get()
     {
-        wait();
+        // wait();
+        MPI_Wait(&request, MPI_STATUS_IGNORE);
         return buffer;
     }
 
+
+    /**
+     * Return the message content formatted as the given data type.
+     */
     template <typename T>
     T get()
     {
@@ -88,22 +178,18 @@ public:
             throw std::logic_error("received message has wrong size for data type");   
         }
 
-        wait();
+        // wait();
+
+        MPI_Wait(&request, MPI_STATUS_IGNORE);
 
         auto value = T();
         std::memcpy(&value, &buffer[0], sizeof(T));
         return value;
     }
 
+
 private:
     // ========================================================================
-    void throw_if_null()
-    {
-        if (is_null())
-        {
-            throw std::logic_error("method call on null request");
-        }
-    }
     friend class Communicator;
     MPI_Request request = MPI_REQUEST_NULL;
     std::string buffer;
@@ -114,7 +200,7 @@ private:
 
 // ============================================================================
 /**
-    This is a simple wrapper class around the MPI_Status struct. It 
+    This is a simple wrapper class around the MPI_Status struct.
 */
 class mpi::Status
 {
@@ -490,6 +576,55 @@ public:
         return value;
     }
 
+
+    /**
+     * Execute an all-to-all communication with character-based data. Each
+     * rank sends the character at index i to rank i. The return value at
+     * index j contains the character received from rank j. More generally if
+     * the send buffer size divides the comm size N times, then N characters
+     * are send to and received from each rank.
+     */
+    std::string all_to_all(const std::string& sendbuf) const
+    {
+        if (sendbuf.size() % size() != 0)
+        {
+            throw std::invalid_argument("all_to_all send buffer must be divisible by the comm size");
+        }
+
+        auto recvbuf = std::string(sendbuf.size(), 0);
+
+        MPI_Alltoall(
+            &sendbuf[0], sendbuf.size() / size(), MPI_CHAR,
+            &recvbuf[0], recvbuf.size() / size(), MPI_CHAR, comm);
+
+        return recvbuf;
+    }
+
+
+    /**
+     * Same as above, except the data type is any standard layout data rather
+     * than char.
+     */
+    template <typename T>
+    std::vector<T> all_to_all(const std::vector<T>& sendbuf) const
+    {
+        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+
+        if (sendbuf.size() % size() != 0)
+        {
+            throw std::invalid_argument("all_to_all send buffer must be divisible by the comm size");
+        }
+
+        auto recvbuf = std::vector<T>(sendbuf.size(), T());
+
+        MPI_Alltoall(
+            &sendbuf[0], sendbuf.size() / size() * sizeof(T), MPI_CHAR,
+            &recvbuf[0], recvbuf.size() / size() * sizeof(T), MPI_CHAR, comm);
+
+        return recvbuf;
+    }
+
+
 private:
     // ========================================================================
     friend Communicator comm_world();
@@ -531,6 +666,16 @@ int main()
             std::cout << comm.recv<double>(mpi::any_source, 124) << std::endl;
             std::cout << comm.irecv(mpi::any_source, 125).get() << std::endl;
             std::cout << comm.irecv(mpi::any_source, 126).get<int>() << std::endl;
+        }
+
+
+        if (comm.rank() == 0)
+        {
+            std::cout << "Rank 0 all-to-all: " << comm.all_to_all("00") << std::endl;
+        }
+        if (comm.rank() == 1)
+        {
+            std::cout << "Rank 1 all-to-all: " << comm.all_to_all("11") << std::endl;
         }
     }
     catch (std::exception& e)
