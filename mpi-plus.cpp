@@ -642,31 +642,45 @@ public:
     }
 
 
-    std::vector<std::string> all_gatherv(const std::string& sendbuf) const
+    /**
+     * Execute an all-gather-v communication. This is a generalization of the
+     * above, where each rank broadcasts to all others a container of items.
+     * The size of the container to be broadcasted need not be the same on
+     * every rank. The container broadcasted by rank j is returned in the j-th
+     * index of the vector returned by this function.
+     */
+    template <typename T>
+    std::vector<std::vector<T>> all_gather(const std::vector<T>& values) const
     {
-        auto recvcounts = all_gather<int>(sendbuf.size());
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
+
+        auto recvcounts = all_gather<int>(values.size());
         auto displs = std::vector<int>();
         std::size_t last = 0;
 
-        for (auto n : recvcounts)
+        for (auto count : recvcounts)
         {
-            displs.push_back(n + last);
-            last += n;
+            displs.push_back(last);
+            last += count;
         }
-        auto recvbuf = std::string(last, 0);
+        auto recvbuf = std::vector<T>(last);
 
         MPI_Allgatherv(
-            &sendbuf[0], sendbuf.size(), MPI_CHAR,
+            &values[0], values.size(), MPI_CHAR,
             &recvbuf[0], &recvcounts[0], &displs[0], MPI_CHAR, comm);
 
-        auto res = std::vector<std::string>(size());
+        auto res = std::vector<std::vector<T>>(size());
+        auto recv = recvbuf.begin();
 
-        for (int i = 0; i < res.size() - 1; ++i)
+        for (int i = 0; i < res.size(); ++i)
         {
-            res[i] = recvbuf.substr(displs[i], displs[i + 1]);
-        }
+            res[i].resize(recvcounts[i]);
 
-        res.back() = recvbuf.substr(displs.back());
+            for (int j = 0; j < res[i].size(); ++j)
+            {
+                res[i][j] = *recv++;
+            }
+        }
         return res;
     }
 
@@ -726,12 +740,13 @@ int main()
 
 
         auto res = comm.all_gather(comm.rank());
+        auto ses = comm.all_gather(std::vector<int>(comm.rank()));
 
         for (int i = 0; i < comm.size(); ++i)
         {
             if (i == comm.rank())
             {
-                std::cout << "rank " << i << ": " << res[i] << std::endl;                
+                std::cout << "rank " << i << ": " << res[i] << " " << ses[i].size() << std::endl;                
             }
             comm.barrier();
         }
