@@ -1,5 +1,6 @@
 #include <string>
 #include <iostream>
+#include <vector>
 #include <mpi.h>
 
 
@@ -16,14 +17,14 @@ namespace mpi {
     constexpr int any_source = MPI_ANY_SOURCE;
 
     namespace detail {
-        template <typename T> inline int make_datatype();
+        // template <typename T> inline int make_datatype_for(const T&);
     }
 }
 
-template <> int mpi::detail::make_datatype<char>  () { return MPI_CHAR; }
-template <> int mpi::detail::make_datatype<int>   () { return MPI_INTEGER; }
-template <> int mpi::detail::make_datatype<float> () { return MPI_FLOAT; }
-template <> int mpi::detail::make_datatype<double>() { return MPI_DOUBLE; }
+// template <> int mpi::detail::make_datatype_for<char>  (const char&)   { return MPI_CHAR; }
+// template <> int mpi::detail::make_datatype_for<int>   (const int&)    { return MPI_INTEGER; }
+// template <> int mpi::detail::make_datatype_for<float> (const float&)  { return MPI_FLOAT; }
+// template <> int mpi::detail::make_datatype_for<double>(const double&) { return MPI_DOUBLE; }
 
 
 
@@ -171,7 +172,7 @@ public:
     template <typename T>
     T get()
     {
-        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
 
         if (buffer.size() != sizeof(T))
         {
@@ -513,7 +514,7 @@ public:
      * cancellation will have no effect. Therefore it is advisable to keep the
      * returned request object, or at least do something equivalent to:
      *
-     *              comm.isend("Message!", 0).wait();
+     *              auto result = comm.isend("Message!", 0).get();
      *
      * Of course this would literally be a blocking send, but you get the
      * idea. In practice you'll probably store the request somewhere and check
@@ -535,7 +536,7 @@ public:
     template <typename T>
     void send(const T& value, int rank, int tag=0) const
     {
-        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
         auto buf = std::string(sizeof(T), 0);
         std::memcpy(&buf[0], &value, sizeof(T));
         send(buf, rank, tag);
@@ -549,7 +550,7 @@ public:
     template <typename T>
     Request isend(const T& value, int rank, int tag=0) const
     {
-        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
         auto buf = std::string(sizeof(T), 0);
         std::memcpy(&buf[0], &value, sizeof(T));
         return isend(buf, rank, tag);
@@ -563,7 +564,7 @@ public:
     template <typename T>
     T recv(int rank, int tag=0) const
     {
-        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
         auto buf = recv(rank, tag);
 
         if (buf.size() != sizeof(T))
@@ -608,11 +609,11 @@ public:
     template <typename T>
     std::vector<T> all_to_all(const std::vector<T>& sendbuf) const
     {
-        static_assert(std::is_standard_layout<T>::value, "type has non-standard layout");
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
 
-        if (sendbuf.size() % size() != 0)
+        if (sendbuf.size() != size())
         {
-            throw std::invalid_argument("all_to_all send buffer must be divisible by the comm size");
+            throw std::invalid_argument("all_to_all send buffer must equal the comm size");
         }
 
         auto recvbuf = std::vector<T>(sendbuf.size(), T());
@@ -622,6 +623,51 @@ public:
             &recvbuf[0], recvbuf.size() / size() * sizeof(T), MPI_CHAR, comm);
 
         return recvbuf;
+    }
+
+
+    /**
+     * Execute an all-gather communication with data of the given scalar type.
+     * The returned vector contains the value provided by process j at int
+     * j-th index.
+     */
+    template <typename T>
+    std::vector<T> all_gather(const T& value) const
+    {
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
+
+        auto recvbuf = std::vector<T>(size(), T());
+        MPI_Allgather(&value, sizeof(T), MPI_CHAR, &recvbuf[0], sizeof(T), MPI_CHAR, comm);
+        return recvbuf;
+    }
+
+
+    std::vector<std::string> all_gatherv(const std::string& sendbuf) const
+    {
+        auto recvcounts = all_gather<int>(sendbuf.size());
+        auto displs = std::vector<int>();
+        std::size_t last = 0;
+
+        for (auto n : recvcounts)
+        {
+            displs.push_back(n + last);
+            last += n;
+        }
+        auto recvbuf = std::string(last, 0);
+
+        MPI_Allgatherv(
+            &sendbuf[0], sendbuf.size(), MPI_CHAR,
+            &recvbuf[0], &recvcounts[0], &displs[0], MPI_CHAR, comm);
+
+        auto res = std::vector<std::string>(size());
+
+        for (int i = 0; i < res.size() - 1; ++i)
+        {
+            res[i] = recvbuf.substr(displs[i], displs[i + 1]);
+        }
+
+        res.back() = recvbuf.substr(displs.back());
+        return res;
     }
 
 
@@ -653,30 +699,43 @@ int main()
     try {
         auto comm = mpi::comm_world();
 
-        if (comm.rank() == 0)
-        {
-            comm.send("Here is a message!", 1, 123);
-            comm.send(3.14, 1, 124);
-            comm.send("the", 1, 125);
-            comm.send(20, 1, 126);
-        }
-        if (comm.rank() == 1)
-        {
-            std::cout << comm.recv(mpi::any_source, 123) << std::endl;
-            std::cout << comm.recv<double>(mpi::any_source, 124) << std::endl;
-            std::cout << comm.irecv(mpi::any_source, 125).get() << std::endl;
-            std::cout << comm.irecv(mpi::any_source, 126).get<int>() << std::endl;
-        }
+        // if (comm.rank() == 0)
+        // {
+        //     comm.send("Here is a message!", 1, 123);
+        //     comm.send(3.14, 1, 124);
+        //     comm.send("the", 1, 125);
+        //     comm.send(20, 1, 126);
+        // }
+        // if (comm.rank() == 1)
+        // {
+        //     std::cout << comm.recv(mpi::any_source, 123) << std::endl;
+        //     std::cout << comm.recv<double>(mpi::any_source, 124) << std::endl;
+        //     std::cout << comm.irecv(mpi::any_source, 125).get() << std::endl;
+        //     std::cout << comm.irecv(mpi::any_source, 126).get<int>() << std::endl;
+        // }
 
 
-        if (comm.rank() == 0)
+        // if (comm.rank() == 0)
+        // {
+        //     std::cout << "Rank 0 all-to-all: " << comm.all_to_all("00") << std::endl;
+        // }
+        // if (comm.rank() == 1)
+        // {
+        //     std::cout << "Rank 1 all-to-all: " << comm.all_to_all("11") << std::endl;
+        // }
+
+
+        auto res = comm.all_gather(comm.rank());
+
+        for (int i = 0; i < comm.size(); ++i)
         {
-            std::cout << "Rank 0 all-to-all: " << comm.all_to_all("00") << std::endl;
+            if (i == comm.rank())
+            {
+                std::cout << "rank " << i << ": " << res[i] << std::endl;                
+            }
+            comm.barrier();
         }
-        if (comm.rank() == 1)
-        {
-            std::cout << "Rank 1 all-to-all: " << comm.all_to_all("11") << std::endl;
-        }
+
     }
     catch (std::exception& e)
     {
