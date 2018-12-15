@@ -579,32 +579,20 @@ public:
 
 
     /**
-     * Execute an all-to-all communication with character-based data. Each
-     * rank sends the character at index i to rank i. The return value at
-     * index j contains the character received from rank j. More generally if
-     * the send buffer size divides the comm size N times, then N characters
-     * are send to and received from each rank.
+     * Execute a bcast operation with the given rank as the root.
      */
-    std::string all_to_all(const std::string& sendbuf) const
+    template <typename T>
+    void bcast(int root, T& value) const
     {
-        if (sendbuf.size() % size() != 0)
-        {
-            throw std::invalid_argument("all_to_all send buffer must be divisible by the comm size");
-        }
-
-        auto recvbuf = std::string(sendbuf.size(), 0);
-
-        MPI_Alltoall(
-            &sendbuf[0], sendbuf.size() / size(), MPI_CHAR,
-            &recvbuf[0], recvbuf.size() / size(), MPI_CHAR, comm);
-
-        return recvbuf;
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
+        MPI_Bcast(&res, sizeof(T), MPI_CHAR, root, comm);
     }
 
 
     /**
-     * Same as above, except the data type is any standard layout data rather
-     * than char.
+     * Execute an all-to-all communication with container of data. Each rank
+     * sends the value at index i to rank i. The return value at index j
+     * contains the character received from rank j.
      */
     template <typename T>
     std::vector<T> all_to_all(const std::vector<T>& sendbuf) const
