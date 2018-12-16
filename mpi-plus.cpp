@@ -1,6 +1,5 @@
 #include <string>
 #include <numeric>
-#include <iostream>
 #include <vector>
 #include <mpi.h>
 
@@ -20,6 +19,9 @@ namespace mpi {
 
     namespace detail {
         // template <typename T> inline int make_datatype_for(const T&);
+    }
+    namespace ext {
+        class log;
     }
 }
 
@@ -617,11 +619,11 @@ public:
      * is ignored by all processes except the root.
      */
     template <typename T>
-    T scatter(int root, const std::vector<T>& sendbuf) const
+    T scatter(int root, const std::vector<T>& values) const
     {
         static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
 
-        if (sendbuf.size() != size())
+        if (root == rank() && values.size() != size())
         {
             throw std::invalid_argument("scatter send buffer must equal the comm size");
         }
@@ -629,7 +631,7 @@ public:
         auto value = T();
 
         MPI_Scatter(
-            &sendbuf[0], sendbuf.size() * sizeof(T), MPI_CHAR,
+            &values[0], sizeof(T), MPI_CHAR,
             &value, sizeof(T), MPI_CHAR, root, comm);
 
         return value;
@@ -646,7 +648,7 @@ public:
     {
         static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
 
-        if (values.size() != size())
+        if (root == rank() && values.size() != size())
         {
             throw std::invalid_argument("scatter send buffer must equal the comm size");
         }
@@ -654,7 +656,7 @@ public:
         if (rank() == root)
         {
             auto sendcounts = std::vector<int>(size());
-            auto senddispls = std::vector<int>();
+            auto senddispls = std::vector<int>{0};
             auto sendbuf    = std::vector<T>();
 
             for (int i = 0; i < values.size(); ++i)
@@ -662,24 +664,25 @@ public:
                 sendcounts[i] = values[i].size() * sizeof(T);
                 sendbuf.insert(sendbuf.end(), values[i].begin(), values[i].end());
             }
-            std::partial_sum(sendcounts.begin(), sendcounts.end(), std::back_inserter(senddispls));
+            std::partial_sum(sendcounts.begin(), sendcounts.end() - 1, std::back_inserter(senddispls));
+
             auto recvcount = scatter(root, sendcounts);
-            auto recvbuf   = std::vector<T>(recvcount);
+            auto recvbuf   = std::vector<T>(recvcount / sizeof(T));
 
             MPI_Scatterv(
                 &sendbuf[0], &sendcounts[0], &senddispls[0], MPI_CHAR,
-                &recvbuf[0], sizeof(T), MPI_CHAR, root, comm);
+                &recvbuf[0], recvcount, MPI_CHAR, root, comm);
 
             return recvbuf;
         }
         else
         {
             auto recvcount = scatter(root, std::vector<int>());
-            auto recvbuf   = std::vector<T>(recvcount);
+            auto recvbuf   = std::vector<T>(recvcount / sizeof(T));
 
             MPI_Scatterv(
                 nullptr, nullptr, nullptr, MPI_CHAR,
-                &recvbuf, sizeof(T), MPI_CHAR, root, comm);
+                &recvbuf[0], recvcount, MPI_CHAR, root, comm);
 
             return recvbuf;
         }
@@ -786,9 +789,98 @@ mpi::Communicator mpi::comm_world()
 
 
 // ============================================================================
+#include <sstream>
+
+class mpi::ext::log
+{
+public:
+
+
+    // ========================================================================
+    using char_type    = std::stringstream::char_type;
+    using traits_type  = std::stringstream::traits_type;
+    using ostream_type = std::basic_ostream<char_type, traits_type>;
+
+
+    // ========================================================================
+    log(const Communicator& comm, std::ostream& stream)
+    : comm(comm)
+    , stream(stream)
+    {
+    }
+
+    log(const log& other)
+    : comm(other.comm)
+    , stream(other.stream)
+    {
+    }
+
+    ~log()
+    {
+        flush();
+    }
+
+    log only(int rank) const
+    {
+        auto res = *this;
+        res.active_rank = rank;
+        return res;
+    }
+
+    log& operator<<(ostream_type& os(ostream_type&))
+    {
+        buffer << os;
+        return *this;
+    }
+
+    template <typename T>
+    log& operator<<(const T& value)
+    {
+        buffer << value;
+        return *this;
+    }
+
+    log& flush()
+    {
+        for (int n = 0; n < comm.size(); ++n)
+        {
+            if (n == comm.rank())
+            {
+                if (active_rank == -1 || active_rank == n)
+                {
+                    stream << buffer.str();
+                }
+            }
+            comm.barrier();
+        }
+        stream.clear();
+        return *this;
+    }
+
+private:
+    // ========================================================================
+    const Communicator& comm;
+    std::ostream& stream;
+    std::stringstream buffer;
+    int active_rank = -1;
+};
+
+
+
+
+// ============================================================================
+#include <iostream>
+
+
+
+
+// ============================================================================
 void example_ring()
 {
     auto comm = mpi::comm_world();
+    auto outp = mpi::ext::log(comm, std::cout);
+
+    outp.only(0) << "\n<--------- isend, recv --------->\n\n";
 
     for (int i = 0; i < comm.size(); ++i)
     {
@@ -798,9 +890,74 @@ void example_ring()
             auto request = comm.isend(content, (comm.rank() + 1) % comm.size());
             auto message = comm.recv((comm.rank() + comm.size() - 1) % comm.size());
 
-            std::cout << "Proc " << comm.rank() << " received '" << message << "'" << std::endl;
+            outp << "Proc " << " " << comm.rank() << " received '" << message << "\n";
         }
     }
+}
+
+
+
+
+// ============================================================================
+void example_scatter()
+{
+    auto comm = mpi::comm_world();
+    auto outp = mpi::ext::log(comm, std::cout);
+    auto res = int();
+
+    outp.only(0) << "\n<--------- scatter --------->\n\n";
+
+    if (comm.rank() == 0)
+    {
+        auto values = std::vector<int>(comm.size());
+
+        for (int n = 0; n < values.size(); ++n)
+        {
+            values[n] = n;
+        }
+        res = comm.scatter(0, values);
+    }
+    else
+    {
+        res = comm.scatter(0, std::vector<int>());
+    }
+    outp << "Rank " << comm.rank() << " has res = " << res << "\n";
+}
+
+
+
+
+// ============================================================================
+void example_scatterv()
+{
+    auto comm = mpi::comm_world();
+    auto outp = mpi::ext::log(comm, std::cout);
+    auto res = std::vector<int>();
+
+    outp.only(0) << "\n<--------- scatterv --------->\n\n";
+
+    if (comm.rank() == 0)
+    {
+        auto values = std::vector<std::vector<int>>(comm.size());
+
+        for (int n = 0; n < values.size(); ++n)
+        {
+            values[n] = std::vector<int>(n + 1, n);
+        }
+        res = comm.scatter(0, values);
+    }
+    else
+    {
+        res = comm.scatter(0, std::vector<std::vector<int>>());
+    }
+    
+    outp << "Rank " << comm.rank() << " has res.size() = " << res.size() << " and values ";
+
+    for (auto v : res)
+    {
+        outp << v << ", ";
+    }
+    outp << "\n";
 }
 
 
@@ -812,6 +969,8 @@ int main()
     auto session = mpi::Session();
 
     example_ring();
+    example_scatter();
+    example_scatterv();
 
     return 0;
 }
