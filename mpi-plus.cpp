@@ -9,6 +9,7 @@
 
 // ============================================================================
 namespace mpi {
+    class Session;
     class Communicator;
     class Request;
     class Status;
@@ -26,6 +27,23 @@ namespace mpi {
 // template <> int mpi::detail::make_datatype_for<int>   (const int&)    { return MPI_INTEGER; }
 // template <> int mpi::detail::make_datatype_for<float> (const float&)  { return MPI_FLOAT; }
 // template <> int mpi::detail::make_datatype_for<double>(const double&) { return MPI_DOUBLE; }
+
+
+
+
+// ============================================================================
+class mpi::Session
+{
+public:
+    Session()
+    {
+        MPI_Init(0, nullptr);
+    }
+    ~Session()
+    {
+        MPI_Finalize();
+    }
+};
 
 
 
@@ -149,10 +167,10 @@ public:
      * Block until the request is fulfilled. After this method returns, the
      * get() method can be called to retrieve the message content.
      */
-    // void wait()
-    // {
-    //     MPI_Wait(&request, MPI_STATUS_IGNORE);
-    // }
+    void wait()
+    {
+        MPI_Wait(&request, MPI_STATUS_IGNORE);
+    }
 
 
     /**
@@ -161,8 +179,8 @@ public:
      */
     const std::string& get()
     {
-        // wait();
-        MPI_Wait(&request, MPI_STATUS_IGNORE);
+        wait();
+        // MPI_Wait(&request, MPI_STATUS_IGNORE);
         return buffer;
     }
 
@@ -180,9 +198,9 @@ public:
             throw std::logic_error("received message has wrong size for data type");   
         }
 
-        // wait();
+        wait();
 
-        MPI_Wait(&request, MPI_STATUS_IGNORE);
+        // MPI_Wait(&request, MPI_STATUS_IGNORE);
 
         auto value = T();
         std::memcpy(&value, &buffer[0], sizeof(T));
@@ -768,59 +786,32 @@ mpi::Communicator mpi::comm_world()
 
 
 // ============================================================================
+void example_ring()
+{
+    auto comm = mpi::comm_world();
+
+    for (int i = 0; i < comm.size(); ++i)
+    {
+        if (i == comm.rank())
+        {
+            auto content = "Hello from proc " + std::to_string(i) + "!";
+            auto request = comm.isend(content, (comm.rank() + 1) % comm.size());
+            auto message = comm.recv((comm.rank() + comm.size() - 1) % comm.size());
+
+            std::cout << "Proc " << comm.rank() << " received '" << message << "'" << std::endl;
+        }
+    }
+}
+
+
+
+
+// ============================================================================
 int main()
 {
-    MPI_Init(0, nullptr);
+    auto session = mpi::Session();
 
-    try {
-        auto comm = mpi::comm_world();
+    example_ring();
 
-        // if (comm.rank() == 0)
-        // {
-        //     comm.send("Here is a message!", 1, 123);
-        //     comm.send(3.14, 1, 124);
-        //     comm.send("the", 1, 125);
-        //     comm.send(20, 1, 126);
-        // }
-        // if (comm.rank() == 1)
-        // {
-        //     std::cout << comm.recv(mpi::any_source, 123) << std::endl;
-        //     std::cout << comm.recv<double>(mpi::any_source, 124) << std::endl;
-        //     std::cout << comm.irecv(mpi::any_source, 125).get() << std::endl;
-        //     std::cout << comm.irecv(mpi::any_source, 126).get<int>() << std::endl;
-        // }
-
-
-        // if (comm.rank() == 0)
-        // {
-        //     std::cout << "Rank 0 all-to-all: " << comm.all_to_all("00") << std::endl;
-        // }
-        // if (comm.rank() == 1)
-        // {
-        //     std::cout << "Rank 1 all-to-all: " << comm.all_to_all("11") << std::endl;
-        // }
-
-        comm.scatter(0, std::vector<int>{1, 2});
-        comm.scatter(0, std::vector<std::vector<int>>{{1, 2}, {1, 2, 3}});
-
-        auto res = comm.all_gather(comm.rank());
-        auto ses = comm.all_gather(std::vector<int>(comm.rank()));
-
-        for (int i = 0; i < comm.size(); ++i)
-        {
-            if (i == comm.rank())
-            {
-                std::cout << "rank " << i << ": " << res[i] << " " << ses[i].size() << std::endl;                
-            }
-            comm.barrier();
-        }
-
-    }
-    catch (std::exception& e)
-    {
-        std::cerr << e.what() << std::endl;
-    }
-
-    MPI_Finalize();
     return 0;
 }
