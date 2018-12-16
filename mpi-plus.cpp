@@ -1,4 +1,5 @@
 #include <string>
+#include <numeric>
 #include <iostream>
 #include <vector>
 #include <mpi.h>
@@ -522,9 +523,12 @@ public:
      */
     Request isend(std::string buf, int rank, int tag=0) const
     {
+        MPI_Request request;
+        MPI_Isend(&buf[0], buf.size(), MPI_CHAR, rank, tag, comm, &request);
+
         Request res;
-        res.buffer = buf;
-        MPI_Isend(&res.buffer[0], buf.size(), MPI_CHAR, rank, tag, comm, &res.request);
+        res.buffer = std::move(buf);
+        res.request = request;
         return res;
     }
 
@@ -585,7 +589,82 @@ public:
     void bcast(int root, T& value) const
     {
         static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
-        MPI_Bcast(&res, sizeof(T), MPI_CHAR, root, comm);
+        MPI_Bcast(&value, sizeof(T), MPI_CHAR, root, comm);
+    }
+
+
+    /**
+     * Execute a scatter communication with the given rank as root. The i-th
+     * index of the send buffer is received by the i-th rank. The send buffer
+     * is ignored by all processes except the root.
+     */
+    template <typename T>
+    T scatter(int root, const std::vector<T>& sendbuf) const
+    {
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
+
+        if (sendbuf.size() != size())
+        {
+            throw std::invalid_argument("scatter send buffer must equal the comm size");
+        }
+
+        auto value = T();
+
+        MPI_Scatter(
+            &sendbuf[0], sendbuf.size() * sizeof(T), MPI_CHAR,
+            &value, sizeof(T), MPI_CHAR, root, comm);
+
+        return value;
+    }
+
+
+    /**
+     * Execute a scatter-v communication with the given rank as root. The i-th
+     * index of the send buffer is received by the i-th rank. The send buffer
+     * is ignored by all processes except the root.
+     */
+    template <typename T>
+    std::vector<T> scatter(int root, const std::vector<std::vector<T>>& values) const
+    {
+        static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
+
+        if (values.size() != size())
+        {
+            throw std::invalid_argument("scatter send buffer must equal the comm size");
+        }
+
+        if (rank() == root)
+        {
+            auto sendcounts = std::vector<int>(size());
+            auto senddispls = std::vector<int>();
+            auto sendbuf    = std::vector<T>();
+
+            for (int i = 0; i < values.size(); ++i)
+            {
+                sendcounts[i] = values[i].size() * sizeof(T);
+                sendbuf.insert(sendbuf.end(), values[i].begin(), values[i].end());
+            }
+            std::partial_sum(sendcounts.begin(), sendcounts.end(), std::back_inserter(senddispls));
+            auto recvcount = scatter(root, sendcounts);
+            auto recvbuf   = std::vector<T>(recvcount);
+
+            MPI_Scatterv(
+                &sendbuf[0], &sendcounts[0], &senddispls[0], MPI_CHAR,
+                &recvbuf[0], sizeof(T), MPI_CHAR, root, comm);
+
+            return recvbuf;
+        }
+        else
+        {
+            auto recvcount = scatter(root, std::vector<int>());
+            auto recvbuf   = std::vector<T>(recvcount);
+
+            MPI_Scatterv(
+                nullptr, nullptr, nullptr, MPI_CHAR,
+                &recvbuf, sizeof(T), MPI_CHAR, root, comm);
+
+            return recvbuf;
+        }
     }
 
 
@@ -644,14 +723,9 @@ public:
 
         auto recvcounts = all_gather<int>(values.size());
         auto displs = std::vector<int>();
-        std::size_t last = 0;
+        std::partial_sum(recvcounts.begin(), recvcounts.end(), std::back_inserter(displs));
 
-        for (auto count : recvcounts)
-        {
-            displs.push_back(last);
-            last += count;
-        }
-        auto recvbuf = std::vector<T>(last);
+        auto recvbuf = std::vector<T>(displs.back());
 
         MPI_Allgatherv(
             &values[0], values.size(), MPI_CHAR,
@@ -726,6 +800,8 @@ int main()
         //     std::cout << "Rank 1 all-to-all: " << comm.all_to_all("11") << std::endl;
         // }
 
+        comm.scatter(0, std::vector<int>{1, 2});
+        comm.scatter(0, std::vector<std::vector<int>>{{1, 2}, {1, 2, 3}});
 
         auto res = comm.all_gather(comm.rank());
         auto ses = comm.all_gather(std::vector<int>(comm.rank()));
