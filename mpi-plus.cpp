@@ -738,26 +738,26 @@ public:
      * index of the vector returned by this function.
      */
     template <typename T>
-    std::vector<std::vector<T>> all_gather(const std::vector<T>& values) const
+    std::vector<std::vector<T>> all_gather(const std::vector<T>& sendbuf) const
     {
         static_assert(std::is_trivially_copyable<T>::value, "type is not trivially copyable");
 
-        auto recvcounts = all_gather<int>(values.size());
-        auto displs = std::vector<int>();
-        std::partial_sum(recvcounts.begin(), recvcounts.end(), std::back_inserter(displs));
+        auto recvcounts = all_gather(int(sendbuf.size() * sizeof(T)));
+        auto recvdispls = std::vector<int>{0};
+        std::partial_sum(recvcounts.begin(), recvcounts.end(), std::back_inserter(recvdispls));
 
-        auto recvbuf = std::vector<T>(displs.back());
+        auto recvbuf = std::vector<T>(recvdispls.back() / sizeof(T));
 
         MPI_Allgatherv(
-            &values[0], values.size(), MPI_CHAR,
-            &recvbuf[0], &recvcounts[0], &displs[0], MPI_CHAR, comm);
+            &sendbuf[0], sendbuf.size() * sizeof(T), MPI_CHAR,
+            &recvbuf[0], &recvcounts[0], &recvdispls[0], MPI_CHAR, comm);
 
         auto res = std::vector<std::vector<T>>(size());
         auto recv = recvbuf.begin();
 
         for (int i = 0; i < res.size(); ++i)
         {
-            res[i].resize(recvcounts[i]);
+            res[i].resize(recvcounts[i] / sizeof(T));
 
             for (int j = 0; j < res[i].size(); ++j)
             {
@@ -842,16 +842,20 @@ public:
 
     log& flush()
     {
-        for (int n = 0; n < comm.size(); ++n)
+        if (active_rank == -1)
         {
-            if (n == comm.rank())
+            for (int n = 0; n < comm.size(); ++n)
             {
-                if (active_rank == -1 || active_rank == n)
+                if (n == comm.rank())
                 {
                     stream << buffer.str();
                 }
+                comm.barrier();
             }
-            comm.barrier();
+        }
+        else if (comm.rank() == active_rank)
+        {
+            stream << buffer.str();
         }
         stream.clear();
         return *this;
@@ -964,6 +968,47 @@ void example_scatterv()
 
 
 // ============================================================================
+void example_all_gather()
+{
+    auto comm = mpi::comm_world();
+    auto outp = mpi::ext::log(comm, std::cout);
+
+    outp.only(0) << "\n<--------- all-gather --------->\n\n";
+
+    for (auto r : comm.all_gather(comm.rank()))
+    {
+        outp.only(0) << r << " ";
+    }
+    outp.only(0) << "\n";
+}
+
+
+
+
+// ============================================================================
+void example_all_gatherv()
+{
+    auto comm = mpi::comm_world();
+    auto outp = mpi::ext::log(comm, std::cout);
+    auto res = comm.all_gather(std::vector<int>(comm.rank() + 1, comm.rank()));
+
+    outp.only(0) << "\n<--------- all-gatherv --------->\n\n";
+
+    outp << "Rank " << comm.rank() << " has res.size() = " << res.size() << "\n";
+
+    outp.only(0) << "The final rank sent values: ";
+
+    for (auto v : res.back())
+    {
+        outp.only(0) << v << ", ";
+    }
+    outp.only(0) << "\n";
+}
+
+
+
+
+// ============================================================================
 int main()
 {
     auto session = mpi::Session();
@@ -971,6 +1016,8 @@ int main()
     example_ring();
     example_scatter();
     example_scatterv();
+    example_all_gather();
+    example_all_gatherv();
 
     return 0;
 }
